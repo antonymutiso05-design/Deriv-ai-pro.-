@@ -79,9 +79,14 @@ with st.sidebar:
         st.error(f"Could not load markets: {e}")
         st.stop()
     labels = [f'{m.get("display_name",m["symbol"])} ({m["symbol"]}) — {m.get("market_display_name",m.get("market","Other"))}' for m in markets]
-    label = st.selectbox("All available active markets", labels)
-    market = markets[labels.index(label)]
-    symbol = market["symbol"]
+    selected_index = st.selectbox(
+    "All available active markets",
+    range(len(markets)),
+    format_func=lambda i: labels[i]
+)
+
+market = markets[selected_index]
+symbol = market["symbol"]
     count = st.select_slider("Historical ticks", options=[20,50,100,200,500,1000], value=100)
     rule = st.selectbox("Strategy to test", ["Over","Under","Matches","Differs","Even","Odd"])
     target = st.selectbox("Target digit / threshold", list(range(10)), index=5)
