@@ -1,26 +1,23 @@
-# DERIV AI PRO — starter build
+# DERIV AI PRO — Version 2
 
-Read-only Streamlit dashboard for Deriv historical tick data and last-digit frequency analysis.
+## Features
+- Dynamically loads all active symbols returned by Deriv.
+- Retrieves historical ticks from Deriv's public WebSocket API.
+- Displays last-digit counts and percentages.
+- Tests Over, Under, Matches, Differs, Even and Odd against the next historical tick.
+- Compares the six strategies by historical hit rate.
 
-## Run locally
+## Run
 ```bash
-py -m venv .venv
-.venv\\Scripts\\activate
-py -m pip install -r requirements.txt
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy
-Upload `app.py`, `requirements.txt`, and `README.md` to GitHub, then deploy the repository using Streamlit Community Cloud.
+## Deployment
+Deploy the repository on Streamlit Community Cloud with `app.py` as the main file.
 
-## Deriv connection
-This version uses Deriv's public market-data WebSocket endpoint:
+## Data and limitations
+Uses the public, unauthenticated endpoint:
 `wss://api.derivws.com/trading/v1/options/ws/public`
 
-No App ID or API token is required for public market data.
-
-## Limitations
-- Historical tick retrieval only; no order placement.
-- Historical frequencies are descriptive statistics, not reliable predictions.
-- Verify market symbols available to your account.
-- Do not put passwords or API tokens in GitHub.
+No API token or App ID is required for public market data. The backtest is a simple one-step historical digit hit-rate test. It does not model contract payouts, fees, slippage, execution or profitability. It does not predict future ticks and does not place trades.
