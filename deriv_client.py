@@ -10,7 +10,12 @@ import websocket  # websocket-client
 import analysis
 import db
 
-WS_URL = "wss://ws.derivws.com/websockets/v3?app_id={app_id}"
+# Tried in order. The first is Deriv's current public market-data gateway (no app ID or token needed).
+# The second is the older endpoint, kept as a fallback.
+WS_URLS = [
+    "wss://api.derivws.com/trading/v1/options/ws/public",
+    "wss://ws.derivws.com/websockets/v3?app_id={app_id}",
+]
 
 
 def digit_of(quote, pip):
@@ -19,16 +24,23 @@ def digit_of(quote, pip):
 
 def fetch_history(symbol, count=5000, app_id="1089"):
     """One-off request for up to 5000 past ticks. Returns a list of last digits."""
-    ws = websocket.create_connection(WS_URL.format(app_id=app_id), timeout=15)
-    try:
-        ws.send(json.dumps({"ticks_history": symbol, "count": count, "end": "latest", "style": "ticks"}))
-        msg = json.loads(ws.recv())
-    finally:
-        ws.close()
-    if "error" in msg:
-        raise RuntimeError(msg["error"]["message"])
-    pip = msg.get("pip_size", 2)
-    return [digit_of(p, pip) for p in msg["history"]["prices"]]
+    last_error = None
+    for template in WS_URLS:
+        try:
+            ws = websocket.create_connection(template.format(app_id=app_id), timeout=15)
+        except Exception as e:  # try the next endpoint
+            last_error = e
+            continue
+        try:
+            ws.send(json.dumps({"ticks_history": symbol, "count": count, "end": "latest", "style": "ticks"}))
+            msg = json.loads(ws.recv())
+        finally:
+            ws.close()
+        if "error" in msg:
+            raise RuntimeError(msg["error"]["message"])
+        pip = msg.get("pip_size", 2)
+        return [digit_of(p, pip) for p in msg["history"]["prices"]]
+    raise RuntimeError(f"Could not connect to any Deriv endpoint. Last error: {last_error}")
 
 
 class TickFeed:
@@ -39,15 +51,19 @@ class TickFeed:
         self.data, self.pip, self.subs = {}, {}, set()
         self.listeners = []
         self.connected, self.last_error = False, ""
+        self.url, self._opened = "", False
         self._ws = None
         threading.Thread(target=self._run, daemon=True).start()
 
     # connection ---------------------------------------------------------
     def _run(self):
+        idx = 0
         while True:
+            self._opened = False
+            self.url = WS_URLS[idx % len(WS_URLS)].format(app_id=self.app_id)
             try:
                 self._ws = websocket.WebSocketApp(
-                    WS_URL.format(app_id=self.app_id),
+                    self.url,
                     on_open=self._on_open, on_message=self._on_message,
                     on_error=lambda ws, e: setattr(self, "last_error", str(e)),
                     on_close=lambda *a: setattr(self, "connected", False))
@@ -55,10 +71,13 @@ class TickFeed:
             except Exception as e:  # keep the thread alive
                 self.last_error = str(e)
             self.connected = False
+            if not self._opened:      # never connected: try the next endpoint
+                idx += 1
             time.sleep(3)
 
     def _on_open(self, ws):
         self.connected = True
+        self._opened = True
         for s in list(self.subs):
             self._request(s)
 

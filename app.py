@@ -63,7 +63,8 @@ tab_live, tab_back, tab_hist = st.tabs(["Live", "Backtest", "Paper trade history
 @st.fragment(run_every=1)
 def live():
     rows = feed.snapshot(cfg.symbol)
-    st.caption(("Connected" if feed.connected else "Connecting") + (f" | {feed.last_error}" if feed.last_error and not feed.connected else ""))
+    st.caption(("Connected" if feed.connected else "Connecting") + f" | {feed.url.split('?')[0]}" +
+               (f" | {feed.last_error[:120]}" if feed.last_error and not feed.connected else ""))
     if len(rows) < cfg.window:
         st.info(f"Collecting ticks: {len(rows)} of {cfg.window}")
         return
