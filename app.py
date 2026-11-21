@@ -1,158 +1,151 @@
-import json, math
-from collections import Counter
-from datetime import datetime, timezone
+"""Deriv Digit Analyser (Streamlit). Run with: streamlit run app.py"""
+import numpy as np
 import pandas as pd
 import streamlit as st
-import websocket
 
-WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
-st.set_page_config(page_title="DERIV AI PRO", page_icon="📊", layout="wide")
+import analysis
+import db
+from analysis import Config
+from deriv_client import PaperBot, TickFeed, fetch_history
 
-@st.cache_data(ttl=300)
-def get_markets():
-    ws = websocket.create_connection(WS_URL, timeout=20)
-    try:
-        ws.send(json.dumps({"active_symbols":"brief","req_id":1}))
-        while True:
-            msg = json.loads(ws.recv())
-            if msg.get("msg_type") == "active_symbols":
-                return msg.get("active_symbols", [])
-            if msg.get("error"):
-                raise RuntimeError(msg["error"].get("message","Deriv API error"))
-    finally:
-        ws.close()
+DB_PATH = "deriv_trades.db"
+SYMBOLS = {
+    "Volatility 10 Index": "R_10", "Volatility 25 Index": "R_25", "Volatility 50 Index": "R_50",
+    "Volatility 75 Index": "R_75", "Volatility 100 Index": "R_100",
+    "Volatility 10 (1s) Index": "1HZ10V", "Volatility 15 (1s) Index": "1HZ15V",
+    "Volatility 25 (1s) Index": "1HZ25V", "Volatility 30 (1s) Index": "1HZ30V",
+    "Volatility 50 (1s) Index": "1HZ50V", "Volatility 75 (1s) Index": "1HZ75V",
+    "Volatility 90 (1s) Index": "1HZ90V", "Volatility 100 (1s) Index": "1HZ100V",
+}
 
-def get_history(symbol, count):
-    ws = websocket.create_connection(WS_URL, timeout=25)
-    try:
-        ws.send(json.dumps({"ticks_history":symbol,"count":int(count),"end":"latest","style":"ticks","req_id":2}))
-        while True:
-            msg = json.loads(ws.recv())
-            if msg.get("msg_type") == "history":
-                h = msg.get("history", {})
-                prices, times = h.get("prices", []), h.get("times", [])
-                if not prices: raise RuntimeError("No historical ticks returned.")
-                return prices, times, msg.get("pip_size")
-            if msg.get("error"):
-                raise RuntimeError(msg["error"].get("message","Deriv API error"))
-    finally:
-        ws.close()
+st.set_page_config(page_title="Deriv Digit Analyser", layout="wide")
 
-def decimals_for(pip_size, prices):
-    if pip_size:
-        try:
-            return max(0, min(10, int(round(-math.log10(float(pip_size))))))
-        except Exception:
-            pass
-    places = []
-    for price in prices:
-        value = str(price)
-        places.append(len(value.split(".", 1)[1].rstrip("0")) if "." in value else 0)
-    return min(10, max(places, default=0))
 
-def digit_of(price, decimals):
-    s = f"{float(price):.{decimals}f}"
-    return int(s[-1]) if s[-1].isdigit() else 0
+@st.cache_resource
+def get_runtime(app_id):
+    feed = TickFeed(app_id)
+    return feed, PaperBot(feed, DB_PATH)
 
-def test_rule(digits, rule, target):
-    wins = []
-    for i in range(len(digits)-1):
-        d = digits[i+1]
-        if rule == "Over": ok = d > target
-        elif rule == "Under": ok = d < target
-        elif rule == "Matches": ok = d == target
-        elif rule == "Differs": ok = d != target
-        elif rule == "Even": ok = d % 2 == 0
-        else: ok = d % 2 == 1
-        wins.append(ok)
-    return wins
 
-st.title("📊 DERIV AI PRO")
-st.caption("All active Deriv markets • Digit statistics • Historical backtesting")
-st.warning("Analysis only: this app does not place trades. Historical hit rates do not predict or guarantee future outcomes.")
-
+# ---------- sidebar ----------
 with st.sidebar:
-    st.header("Market selection")
-    if st.button("Refresh markets"): get_markets.clear()
-    try: markets = [m for m in get_markets() if m.get("symbol")]
-    except Exception as e:
-        st.error(f"Could not load markets: {e}")
-        st.stop()
-    labels = [f'{m.get("display_name",m["symbol"])} ({m["symbol"]}) — {m.get("market_display_name",m.get("market","Other"))}' for m in markets]
-    selected_index = st.selectbox(
-    "All available active markets",
-    range(len(markets)),
-    format_func=lambda i: labels[i]
-)
+    st.header("Settings")
+    app_id = st.text_input("Deriv app ID", "1089", help="1089 is Deriv's public test ID. Use your own when you have one.")
+    name = st.selectbox("Market", list(SYMBOLS), index=4)
+    strategy = st.selectbox("Strategy", analysis.STRATEGIES)
+    if strategy == "over":
+        barrier = st.selectbox("Barrier digit", range(0, 9), index=2)
+    elif strategy == "under":
+        barrier = st.selectbox("Barrier digit", range(1, 10), index=7)
+    elif strategy in ("matches", "differs"):
+        barrier = st.selectbox("Digit", range(0, 10), index=5)
+    else:
+        barrier = 0
+    window = st.selectbox("Last digits analysed", [20, 50, 100, 200, 500], index=2)
+    rule = st.radio("Signal rule", ["follow", "revert"], horizontal=True,
+                    format_func=lambda r: "Rate above expected" if r == "follow" else "Rate below expected")
+    thr = st.slider("Z-score threshold", 0.5, 4.0, 2.0, 0.5)
+    margin = st.slider("Assumed payout efficiency", 0.90, 1.00, 0.95, 0.01,
+                       help="0.95 assumes about a 5% house margin. Deriv's platform shows exact payouts.")
+    bot_on = st.toggle("Run paper-trading bot", value=False)
+    st.caption("Paper trades use fake money. Nothing here can place a real trade.")
 
-market = markets[selected_index]
-symbol = market["symbol"]
-    count = st.select_slider("Historical ticks", options=[20,50,100,200,500,1000], value=100)
-    rule = st.selectbox("Strategy to test", ["Over","Under","Matches","Differs","Even","Odd"])
-    target = st.selectbox("Target digit / threshold", list(range(10)), index=5)
+cfg = Config(SYMBOLS[name], strategy, int(barrier), int(window), rule, float(thr), float(margin))
+feed, bot = get_runtime(app_id.strip() or "1089")
+feed.subscribe(cfg.symbol)
+bot.configure(cfg, bot_on)
 
-if st.button("Load market data and run analysis", type="primary"):
-    with st.spinner(f"Loading historical data for {symbol}..."):
+st.title("Deriv Digit Analyser")
+tab_live, tab_back, tab_hist = st.tabs(["Live", "Backtest", "Paper trade history"])
+
+
+# ---------- live ----------
+@st.fragment(run_every=1)
+def live():
+    rows = feed.snapshot(cfg.symbol)
+    st.caption(("Connected" if feed.connected else "Connecting") + (f" | {feed.last_error}" if feed.last_error and not feed.connected else ""))
+    if len(rows) < cfg.window:
+        st.info(f"Collecting ticks: {len(rows)} of {cfg.window}")
+        return
+    digits = [r[2] for r in rows]
+    a = analysis.analyse_live(digits, cfg)
+    pip = feed.pip.get(cfg.symbol, 2)
+
+    c1, c2 = st.columns([1, 1])
+    c1.metric("Latest tick", f"{rows[-1][1]:.{pip}f}")
+    c2.metric("Signal (paper only)", "BUY" if a["signal"] else "WAIT")
+
+    chips = "".join(
+        f"<span style='display:inline-block;width:34px;height:40px;line-height:40px;text-align:center;margin:0 5px 5px 0;"
+        f"border:1px solid {'#1b7f79' if analysis.outcome([d], cfg.strategy, cfg.barrier)[0] else '#888'};border-radius:6px;"
+        f"font:600 18px monospace'>{d}</span>" for d in digits[-20:])
+    st.markdown("**Last 20 digits** (green outline = would have won)")
+    st.markdown(chips, unsafe_allow_html=True)
+
+    freq = pd.DataFrame({"frequency %": a["counts"] / cfg.window * 100}, index=pd.Index(range(10), name="digit"))
+    st.markdown(f"**Digit frequency, last {cfg.window}** (expected 10% each; hot {a['hot']}, cold {a['cold']})")
+    st.bar_chart(freq, height=240)
+
+    m = st.columns(4)
+    m[0].metric(f"{analysis.label(cfg.strategy, cfg.barrier)} expected", f"{a['p'] * 100:.0f}%")
+    m[1].metric(f"Observed, last {cfg.window}", f"{a['obs'] * 100:.1f}%")
+    m[2].metric("Z score", f"{a['z']:.2f}")
+    m[3].metric("Repeat streak", f"{digits[-1]} x{a['run']}" if a["run"] > 1 else "none")
+    verdict = "Digits look consistent with random" if a["chi_p"] >= 0.05 else "Distribution deviates from uniform (check again on fresh data)"
+    st.caption(f"Chi-square randomness test: p = {a['chi_p']:.3f}. {verdict}.")
+
+
+with tab_live:
+    live()
+
+
+# ---------- backtest ----------
+with tab_back:
+    st.write("Replays the current signal rule on up to 5,000 past ticks. Each signal places a trade on the next tick.")
+    if st.button("Run backtest"):
         try:
-            prices, times, pip = get_history(symbol, count)
-            places = decimals_for(pip, prices)
-            digits = [digit_of(p, places) for p in prices]
-            df = pd.DataFrame({
-                "Time": [datetime.fromtimestamp(int(t),tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S") for t in times],
-                "Price": [float(p) for p in prices],
-                "Digit": digits
-            })
-            st.session_state["df"] = df
-            st.session_state["symbol"] = symbol
-            st.session_state["places"] = places
-            st.session_state["digits"] = digits
+            st.session_state["hist"] = (cfg.symbol, fetch_history(cfg.symbol, 5000, app_id.strip() or "1089"))
         except Exception as e:
-            st.error(f"Could not retrieve data: {e}")
+            st.error(f"Could not fetch history: {e}")
+    sym, hist = st.session_state.get("hist", (None, None))
+    if hist:
+        st.caption(f"{len(hist)} ticks of {sym}")
+        r = analysis.backtest(hist, cfg)
+        if r is None or r["trades"] == 0:
+            st.warning("No trades triggered. Lower the threshold or use a shorter window.")
+        else:
+            m = st.columns(5)
+            m[0].metric("Trades", r["trades"])
+            m[1].metric("Win rate", f"{r['win_rate'] * 100:.1f}%")
+            m[2].metric("Expected", f"{r['expected'] * 100:.1f}%")
+            m[3].metric("Paper profit", f"{r['pnl']:.1f}")
+            m[4].metric("p-value", f"{r['p_value']:.3f}")
+            st.line_chart(pd.DataFrame({"cumulative profit": r["equity"]}))
+            st.caption("The p-value tests whether the win rate differs from chance. Even a low value needs fresh data to confirm.")
+        if st.button("Scan 40 rule variants"):
+            table = analysis.scan(hist, cfg)
+            st.dataframe(table, use_container_width=True)
+            st.caption(f"With 40 variants, about {40 * 0.05:.0f} will show p < 0.05 by luck alone, and the top row will usually look "
+                       "profitable. Re-test the top rule on new ticks before believing it.")
 
-if "df" not in st.session_state:
-    st.info("Choose a market, tick count and strategy, then select **Load market data and run analysis**.")
-    st.write(f"Currently available active symbols returned by Deriv: **{len(markets)}**")
-    st.stop()
 
-df, digits = st.session_state["df"], st.session_state["digits"]
-freq, n = Counter(digits), len(digits)
-st.subheader(f'Market: {st.session_state["symbol"]}')
-a,b,c,d = st.columns(4)
-a.metric("Ticks loaded", n)
-b.metric("Decimal places", st.session_state["places"])
-c.metric("Most frequent digit", freq.most_common(1)[0][0] if freq else "—")
-d.metric("Latest digit", digits[-1] if digits else "—")
-
-left,right = st.columns(2)
-with left:
-    st.markdown("### Digit frequency")
-    fdf = pd.DataFrame({"Digit":range(10),"Count":[freq.get(i,0) for i in range(10)],"Percentage":[round(freq.get(i,0)/n*100,2) if n else 0 for i in range(10)]})
-    st.bar_chart(fdf.set_index("Digit")["Count"])
-    st.dataframe(fdf,hide_index=True,use_container_width=True)
-with right:
-    st.markdown("### Latest 20 ticks")
-    st.dataframe(df.tail(20).iloc[::-1],hide_index=True,use_container_width=True)
-
-st.markdown("### Historical strategy backtest")
-st.caption("Each observed digit is tested against the next historical tick. This is a one-step hit-rate test, not a contract payout or profitability simulation.")
-wins_list = test_rule(digits, rule, target)
-if wins_list:
-    wins, total = sum(wins_list), len(wins_list)
-    rate = wins/total*100
-    x,y,z,q = st.columns(4)
-    x.metric("Strategy",rule)
-    y.metric("Tests",total)
-    z.metric("Wins / losses",f"{wins} / {total-wins}")
-    q.metric("Historical hit rate",f"{rate:.2f}%")
-    st.progress(rate/100)
-else: st.warning("At least two ticks are required for backtesting.")
-
-st.markdown("### Compare all six strategies")
-rows=[]
-for name in ["Over","Under","Matches","Differs","Even","Odd"]:
-    result=test_rule(digits,name,target)
-    total=len(result); w=sum(result)
-    rows.append({"Strategy":name,"Wins":w,"Losses":total-w,"Hit rate (%)":round(w/total*100,2) if total else 0})
-st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
-st.markdown("### Recent digit sequence")
-st.code("  ".join(map(str,digits[-50:])))
+# ---------- history ----------
+with tab_hist:
+    df = db.load_trades(DB_PATH)
+    if df.empty:
+        st.info("No paper trades yet. Turn on the paper-trading bot in the sidebar and wait for BUY signals.")
+    else:
+        t, w, exp = len(df), int(df["win"].sum()), float(df["p"].mean())
+        z = (w - t * exp) / np.sqrt(t * exp * (1 - exp)) if 0 < exp < 1 else 0.0
+        m = st.columns(4)
+        m[0].metric("Trades", t)
+        m[1].metric("Win rate", f"{w / t * 100:.1f}%")
+        m[2].metric("Expected", f"{exp * 100:.1f}%")
+        m[3].metric("Paper profit", f"{df['pnl'].sum():.2f}")
+        st.line_chart(pd.DataFrame({"cumulative profit": df["pnl"].cumsum()}))
+        st.dataframe(df.iloc[::-1], use_container_width=True, hide_index=True)
+        c1, c2 = st.columns(2)
+        c1.download_button("Download CSV", df.to_csv(index=False), "paper_trades.csv", "text/csv")
+        if c2.button("Clear history"):
+            db.clear_trades(DB_PATH)
+            st.rerun()
